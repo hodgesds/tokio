@@ -6,11 +6,14 @@
 //! `TOKIO_LLC_BENCH_WORKERS` overrides the worker count. By default, the
 //! benchmark uses at least one worker per discovered LLC so the enabled case
 //! cannot silently take the undersized-pool fallback.
+//! `TOKIO_LLC_BENCH_TASKS` overrides the number of tasks in the spawn and wake
+//! benchmarks. The default is 4,096.
 //!
 //! `TOKIO_LLC_BENCH_CACHE_BYTES` overrides the per-task working-set size in
 //! the cache-affine wake benchmarks. The default is 2 MiB per task, with two
-//! tasks per LLC. Workers are pinned across the discovered LLCs for these
-//! benchmarks so each task first-touches its allocation on its target LLC.
+//! tasks per LLC. Workers are pinned across the discovered LLCs so each task
+//! first-touches its allocation on its target LLC and worker placement remains
+//! consistent between enabled and disabled runs.
 //! `TOKIO_LLC_BENCH_CACHE_TASKS_PER_LLC` can increase the task density to fill
 //! or exceed each LLC; for example, 16 tasks use 32 MiB per LLC by default.
 
@@ -37,7 +40,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, LlcAwareConfig, Runtime};
 
 #[cfg(all(tokio_unstable, target_os = "linux"))]
-const TASKS: usize = 4_096;
+const DEFAULT_TASKS: usize = 4_096;
 
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 const CACHE_BYTES_PER_TASK: usize = 2 * 1024 * 1024;
@@ -74,19 +77,24 @@ impl Mode {
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 fn remote_spawn(c: &mut Criterion) {
     let (workers, topology) = benchmark_topology();
-    let mut group = c.benchmark_group("llc_aware/remote_spawn");
-    group.throughput(Throughput::Elements(TASKS as u64));
+    let worker_cpus = benchmark_worker_cpus(workers, topology.partition_count())
+        .expect("the LLC benchmark requires Linux sysfs topology");
+    let tasks = benchmark_tasks();
+    let mut group = c.benchmark_group(format!(
+        "llc_aware/remote_spawn/{workers}_workers/{tasks}_tasks"
+    ));
+    group.throughput(Throughput::Elements(tasks as u64));
 
     for mode in [Mode::Disabled, Mode::Enabled] {
-        let runtime = runtime(mode, workers, topology.clone());
+        let runtime = pinned_runtime(mode, workers, topology.clone(), worker_cpus.clone());
         group.bench_with_input(BenchmarkId::from_parameter(mode.name()), &mode, |b, _| {
             b.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
-                let mut handles = Vec::with_capacity(TASKS);
+                let mut handles = Vec::with_capacity(tasks);
 
                 for _ in 0..iterations {
                     let start = Instant::now();
-                    for _ in 0..TASKS {
+                    for _ in 0..tasks {
                         handles.push(runtime.spawn(async {}));
                     }
                     runtime.block_on(async {
@@ -109,24 +117,30 @@ fn remote_spawn(c: &mut Criterion) {
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 fn hinted_spawn(c: &mut Criterion) {
     let (workers, topology) = benchmark_topology();
+    let worker_cpus = benchmark_worker_cpus(workers, topology.partition_count())
+        .expect("the LLC benchmark requires Linux sysfs topology");
+    let tasks = benchmark_tasks();
     let partitions = topology.partition_count();
-    let mut group = c.benchmark_group("llc_aware/hinted_spawn");
-    group.throughput(Throughput::Elements(TASKS as u64));
+    let mut group = c.benchmark_group(format!(
+        "llc_aware/hinted_spawn/{workers}_workers/{tasks}_tasks"
+    ));
+    group.throughput(Throughput::Elements(tasks as u64));
 
     for mode in [Mode::Disabled, Mode::Enabled] {
-        let runtime = runtime(mode, workers, topology.clone());
+        let runtime = pinned_runtime(mode, workers, topology.clone(), worker_cpus.clone());
         group.bench_with_input(BenchmarkId::from_parameter(mode.name()), &mode, |b, _| {
             b.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
-                let mut handles = Vec::with_capacity(TASKS);
+                let mut handles = Vec::with_capacity(tasks);
 
                 for _ in 0..iterations {
                     let start = Instant::now();
-                    for task in 0..TASKS {
+                    for task in 0..tasks {
+                        let lane = task / partitions;
                         handles.push(
                             tokio::task::Builder::new()
                                 .llc_partition(task % partitions)
-                                .weight(512 << (task % 3))
+                                .weight(512 << (lane % 3))
                                 .spawn_on(async {}, runtime.handle())
                                 .unwrap(),
                         );
@@ -153,21 +167,26 @@ fn hinted_spawn(c: &mut Criterion) {
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 fn affine_wake(c: &mut Criterion) {
     let (workers, topology) = benchmark_topology();
-    let mut group = c.benchmark_group("llc_aware/affine_wake");
-    group.throughput(Throughput::Elements(TASKS as u64));
+    let worker_cpus = benchmark_worker_cpus(workers, topology.partition_count())
+        .expect("the LLC benchmark requires Linux sysfs topology");
+    let tasks = benchmark_tasks();
+    let mut group = c.benchmark_group(format!(
+        "llc_aware/affine_wake/{workers}_workers/{tasks}_tasks"
+    ));
+    group.throughput(Throughput::Elements(tasks as u64));
 
     for mode in [Mode::Disabled, Mode::Enabled] {
-        let runtime = runtime(mode, workers, topology.clone());
+        let runtime = pinned_runtime(mode, workers, topology.clone(), worker_cpus.clone());
         group.bench_with_input(BenchmarkId::from_parameter(mode.name()), &mode, |b, _| {
             b.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
 
                 for _ in 0..iterations {
                     let (ready_tx, ready_rx) = mpsc::channel();
-                    let mut wakes = Vec::with_capacity(TASKS);
-                    let mut handles = Vec::with_capacity(TASKS);
+                    let mut wakes = Vec::with_capacity(tasks);
+                    let mut handles = Vec::with_capacity(tasks);
 
-                    for _ in 0..TASKS {
+                    for _ in 0..tasks {
                         let ready_tx = ready_tx.clone();
                         let (wake_tx, wake_rx) = tokio::sync::oneshot::channel();
                         wakes.push(wake_tx);
@@ -177,7 +196,7 @@ fn affine_wake(c: &mut Criterion) {
                         }));
                     }
                     drop(ready_tx);
-                    for _ in 0..TASKS {
+                    for _ in 0..tasks {
                         ready_rx.recv().unwrap();
                     }
 
@@ -250,7 +269,7 @@ fn cache_affine_wake_with_weights(
         "cache_affine_wake"
     };
     let mut group = c.benchmark_group(format!(
-        "llc_aware/{workload}/{cache_bytes}_bytes/{tasks_per_partition}_tasks_per_llc"
+        "llc_aware/{workload}/{workers}_workers/{cache_bytes}_bytes/{tasks_per_partition}_tasks_per_llc"
     ));
     group.throughput(Throughput::Bytes(bytes_touched as u64));
 
@@ -401,18 +420,12 @@ fn benchmark_topology() -> (usize, LlcAwareConfig) {
 }
 
 #[cfg(all(tokio_unstable, target_os = "linux"))]
-fn runtime(mode: Mode, workers: usize, topology: LlcAwareConfig) -> Runtime {
-    let mut builder = Builder::new_multi_thread();
-    builder.worker_threads(workers).enable_all();
-    match mode {
-        Mode::Disabled => {
-            builder.disable_llc_aware();
-        }
-        Mode::Enabled => {
-            builder.llc_aware(topology);
-        }
-    }
-    builder.build().unwrap()
+fn benchmark_tasks() -> usize {
+    std::env::var("TOKIO_LLC_BENCH_TASKS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|tasks| *tasks > 0)
+        .unwrap_or(DEFAULT_TASKS)
 }
 
 #[cfg(all(tokio_unstable, target_os = "linux"))]
