@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use tokio::runtime::{Builder, LlcAwareConfig, Runtime};
+use tokio::runtime::{Builder, LlcAwareConfig, LlcTaskHint, Runtime};
 
 thread_local! {
     static TEST_PARTITION: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -137,6 +137,153 @@ fn default_partition_queue_is_fifo() {
         for task in tasks {
             task.await.unwrap();
         }
+    });
+}
+
+#[test]
+fn weighted_partition_queue_prefers_larger_weight() {
+    let mut config = LlcAwareConfig::new(1, |_| Some(0));
+    config.refresh_interval(1);
+
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(1)
+        .llc_aware(config)
+        .build()
+        .unwrap();
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let gate = runtime.spawn(async move {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let (order_tx, order_rx) = mpsc::channel();
+    let low = tokio::task::Builder::new()
+        .llc_partition(0)
+        .weight(1)
+        .spawn_on(
+            {
+                let order_tx = order_tx.clone();
+                async move { order_tx.send("low").unwrap() }
+            },
+            runtime.handle(),
+        )
+        .unwrap();
+    let high = tokio::task::Builder::new()
+        .llc_partition(0)
+        .weight(u32::MAX)
+        .spawn_on(
+            async move { order_tx.send("high").unwrap() },
+            runtime.handle(),
+        )
+        .unwrap();
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        order_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "high"
+    );
+    assert_eq!(
+        order_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "low"
+    );
+
+    runtime.block_on(async {
+        gate.await.unwrap();
+        low.await.unwrap();
+        high.await.unwrap();
+    });
+}
+
+#[test]
+fn task_weight_overrides_enqueue_callback() {
+    let (mut config, seen) = synthetic_topology(1, 0);
+    config.on_task_enqueue(|_| {
+        LlcTaskHint::new()
+            .with_partition(0)
+            .with_weight(u32::MAX)
+    });
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(1)
+        .llc_aware(config)
+        .build()
+        .unwrap();
+    wait_for_partitions(&seen, 1);
+    wait_for_partition_queues(&runtime, 1);
+    let (release, gate) = block_partition(&runtime, 0);
+    let (order_tx, order_rx) = mpsc::channel();
+
+    // Supplying only a weight still invokes the callback, after which the
+    // per-task weight must take precedence.
+    let low = tokio::task::Builder::new()
+        .weight(1)
+        .spawn_on(
+            {
+                let order_tx = order_tx.clone();
+                async move { order_tx.send("low").unwrap() }
+            },
+            runtime.handle(),
+        )
+        .unwrap();
+    let callback_high = runtime.spawn(async move { order_tx.send("callback").unwrap() });
+
+    release.send(()).unwrap();
+    assert_eq!(
+        order_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "callback"
+    );
+    assert_eq!(
+        order_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "low"
+    );
+    runtime.block_on(async {
+        gate.await.unwrap();
+        low.await.unwrap();
+        callback_high.await.unwrap();
+    });
+}
+
+#[test]
+fn zero_and_one_task_weights_are_fifo() {
+    let runtime = synthetic_runtime(1, 1, 0);
+    let (release, gate) = block_partition(&runtime, 0);
+    let (order_tx, order_rx) = mpsc::channel();
+
+    let zero = tokio::task::Builder::new()
+        .llc_partition(0)
+        .weight(0)
+        .spawn_on(
+            {
+                let order_tx = order_tx.clone();
+                async move { order_tx.send("zero").unwrap() }
+            },
+            runtime.handle(),
+        )
+        .unwrap();
+    let one = tokio::task::Builder::new()
+        .llc_partition(0)
+        .weight(1)
+        .spawn_on(
+            async move { order_tx.send("one").unwrap() },
+            runtime.handle(),
+        )
+        .unwrap();
+
+    release.send(()).unwrap();
+    assert_eq!(
+        order_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "zero"
+    );
+    assert_eq!(
+        order_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "one"
+    );
+    runtime.block_on(async {
+        gate.await.unwrap();
+        zero.await.unwrap();
+        one.await.unwrap();
     });
 }
 
@@ -405,7 +552,7 @@ fn cross_llc_stealing_neither_loses_nor_duplicates_tasks() {
 }
 
 #[test]
-fn shutdown_drops_tasks_from_llc_queues() {
+fn shutdown_drops_tasks_from_fifo_and_weighted_queues() {
     struct CountDrop(Arc<AtomicUsize>);
 
     impl Drop for CountDrop {
@@ -421,9 +568,12 @@ fn shutdown_drops_tasks_from_llc_queues() {
 
     for index in 0..TASKS {
         let guard = CountDrop(dropped.clone());
+        let mut builder = tokio::task::Builder::new().llc_partition(index % 2);
+        if index % 2 == 1 {
+            builder = builder.weight(512 << (index % 3));
+        }
         handles.push(
-            tokio::task::Builder::new()
-                .llc_partition(index % 2)
+            builder
                 .spawn_on(
                     async move {
                         let _guard = guard;

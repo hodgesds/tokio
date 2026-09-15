@@ -286,7 +286,7 @@ impl<S> Notified<S> {
     pub(crate) unsafe fn set_llc_options(&self, options: crate::runtime::LlcTaskOptions) {
         use std::sync::atomic::Ordering::Relaxed;
 
-        if options.placement.is_none() {
+        if options.placement.is_none() && options.weight.is_none() {
             return;
         }
         // Safety: The caller guarantees that the task has not been submitted

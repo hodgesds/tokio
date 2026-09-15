@@ -97,7 +97,7 @@ fn remote_spawn(c: &mut Criterion) {
     group.finish();
 }
 
-/// Measures explicit per-task placement through `task::Builder`.
+/// Measures explicit per-task placement and weighting through `task::Builder`.
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 fn hinted_spawn(c: &mut Criterion) {
     let (workers, topology) = benchmark_topology();
@@ -118,6 +118,7 @@ fn hinted_spawn(c: &mut Criterion) {
                         handles.push(
                             tokio::task::Builder::new()
                                 .llc_partition(task % partitions)
+                                .weight(512 << (task % 3))
                                 .spawn_on(async {}, runtime.handle())
                                 .unwrap(),
                         );

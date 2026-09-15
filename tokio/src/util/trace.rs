@@ -14,7 +14,7 @@ cfg_rt! {
         /// This is wrapped in a type that may be empty when `tokio_unstable` is
         /// not enabled.
         pub(crate) spawned_at: crate::runtime::task::SpawnLocation,
-        /// LLC placement override from `task::Builder`.
+        /// LLC placement and weight overrides from `task::Builder`.
         #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
         pub(crate) llc: crate::runtime::LlcTaskOptions,
         _pd: PhantomData<&'a ()>,

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 /// Configuration for LLC-aware scheduling on the multi-thread runtime.
 ///
-/// LLC-aware scheduling adds one shared queue per last-level-cache
+/// LLC-aware scheduling adds one shared, weighted queue per last-level-cache
 /// partition. A worker checks its current partition before considering work
 /// from other LLCs on the same NUMA node, then other NUMA nodes. Tokio
 /// periodically calls `current_partition` and also calls it after the worker
@@ -191,13 +191,13 @@ impl LlcAwareConfig {
         self
     }
 
-    /// Sets a callback that supplies a placement hint when a task is enqueued
-    /// into a shared scheduler queue.
+    /// Sets a callback that supplies placement and weight hints when a task is
+    /// enqueued into a shared scheduler queue.
     ///
     /// By default, a task inherits the partition on which it was last polled.
     /// The callback may override that placement, route the task through the
-    /// global queue. The callback is only used when LLC-aware scheduling is
-    /// enabled. Options set directly on
+    /// global queue, and adjust its relative weight. The callback is only used
+    /// when LLC-aware scheduling is enabled. Options set directly on
     /// [`task::Builder`](crate::task::Builder) take precedence over this
     /// callback.
     pub fn on_task_enqueue<F>(&mut self, f: F) -> &mut Self
@@ -269,20 +269,25 @@ impl fmt::Debug for LlcAwareConfig {
     }
 }
 
-/// A userspace placement hint for a task entering an LLC queue.
+/// A userspace scheduling hint for a task entering an LLC queue.
 ///
 /// A task inherits the LLC on which it was last polled unless the placement is
-/// overridden.
+/// overridden. Weight controls relative ordering within a partition: larger
+/// weights advance virtual time more slowly and are selected sooner. The
+/// default weight is 1024, matching the conventional scheduler weight scale.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LlcTaskHint {
     pub(crate) placement: LlcTaskPlacement,
+    pub(crate) weight: u32,
 }
 
 impl LlcTaskHint {
-    /// Creates a hint that inherits the task's previous LLC.
+    /// Creates a hint that inherits the task's previous LLC and uses the
+    /// default weight.
     pub const fn new() -> Self {
         Self {
             placement: LlcTaskPlacement::Inherit,
+            weight: 1024,
         }
     }
 
@@ -298,6 +303,13 @@ impl LlcTaskHint {
         self
     }
 
+    /// Sets the task's relative scheduling weight.
+    ///
+    /// A zero weight is treated as one by the scheduler.
+    pub const fn with_weight(mut self, weight: u32) -> Self {
+        self.weight = weight;
+        self
+    }
 }
 
 impl Default for LlcTaskHint {
@@ -317,6 +329,7 @@ pub(crate) enum LlcTaskPlacement {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LlcTaskOptions {
     pub(crate) placement: Option<LlcTaskPlacement>,
+    pub(crate) weight: Option<u32>,
 }
 
 #[cfg(target_os = "linux")]

@@ -92,6 +92,7 @@ mod group_a {
             let submit = loom::thread::spawn(move || {
                 let task = task::Builder::new()
                     .llc_partition(0)
+                    .weight(2048)
                     .spawn_on(track(async {}), &handle)
                     .unwrap();
                 drop(task);

@@ -21,6 +21,7 @@ use std::{future::Future, io, mem};
 /// - [`name`], which specifies an associated name for
 ///   the task
 /// - [`llc_partition`], which selects a last-level-cache partition
+/// - [`weight`], which sets the task's relative weight in an LLC queue
 ///
 /// There are three types of task that can be spawned from a Builder:
 /// - [`spawn_local`] for executing not [`Send`] futures
@@ -59,6 +60,7 @@ use std::{future::Future, io, mem};
 /// [unstable]: crate#unstable-features
 /// [`name`]: Builder::name
 /// [`llc_partition`]: Builder::llc_partition
+/// [`weight`]: Builder::weight
 /// [`spawn_local`]: Builder::spawn_local
 /// [`spawn`]: Builder::spawn
 /// [`spawn_blocking`]: Builder::spawn_blocking
@@ -102,6 +104,18 @@ impl<'a> Builder<'a> {
     #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
     pub fn llc_partition(mut self, partition: usize) -> Self {
         self.llc.placement = Some(LlcTaskPlacement::Partition(partition));
+        self
+    }
+
+    /// Assigns the task's relative weight within an LLC queue.
+    ///
+    /// Larger values are selected sooner. Zero is treated as one. This has no
+    /// effect when LLC-aware scheduling is disabled or while the task remains
+    /// in a worker-private queue.
+    #[cfg(feature = "rt-multi-thread")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    pub fn weight(mut self, weight: u32) -> Self {
+        self.llc.weight = Some(weight.max(1));
         self
     }
 

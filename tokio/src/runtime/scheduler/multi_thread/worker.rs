@@ -1786,13 +1786,23 @@ impl Handle {
     ) -> Option<usize> {
         if let (Some(config), Some(queues)) = (&self.shared.config.llc_aware, &self.shared.llc) {
             let task_options = task.llc_options();
-            let mut hint = if let Some(callback) = &config.task_hint {
+            let mut hint = if let (Some(placement), Some(weight)) =
+                (task_options.placement, task_options.weight)
+            {
+                LlcTaskHint {
+                    placement,
+                    weight,
+                }
+            } else if let Some(callback) = &config.task_hint {
                 callback(&task.task_meta())
             } else {
                 LlcTaskHint::default()
             };
             if let Some(placement) = task_options.placement {
                 hint.placement = placement;
+            }
+            if let Some(weight) = task_options.weight {
+                hint.weight = weight;
             }
             let partition = match hint.placement {
                 LlcTaskPlacement::Inherit => task
@@ -1812,7 +1822,7 @@ impl Handle {
                 // global queue instead. This is especially important when a
                 // pool has fewer workers than the machine has LLCs.
                 if queues.worker_count(partition) > 0 {
-                    queues.push(partition, task);
+                    queues.push(partition, task, hint.weight);
                     return Some(partition);
                 }
             }
