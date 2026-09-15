@@ -8,9 +8,9 @@
 //! cannot silently take the undersized-pool fallback.
 //!
 //! `TOKIO_LLC_BENCH_CACHE_BYTES` overrides the per-task working-set size in
-//! the cache-affine wake benchmark. The default is 2 MiB per task, with two
-//! tasks per LLC. Workers are pinned across the discovered LLCs for this
-//! benchmark so each task first-touches its allocation on its target LLC.
+//! the cache-affine wake benchmarks. The default is 2 MiB per task, with two
+//! tasks per LLC. Workers are pinned across the discovered LLCs for these
+//! benchmarks so each task first-touches its allocation on its target LLC.
 
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 use criterion::{
@@ -200,6 +200,18 @@ fn affine_wake(c: &mut Criterion) {
 /// caches but small enough for multiple tasks to remain resident in an LLC.
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 fn cache_affine_wake(c: &mut Criterion) {
+    cache_affine_wake_with_weights(c, false);
+}
+
+/// Runs the cache-affine workload with two competing weights in every LLC,
+/// exercising the weighted queue without changing the memory access pattern.
+#[cfg(all(tokio_unstable, target_os = "linux"))]
+fn weighted_cache_affine_wake(c: &mut Criterion) {
+    cache_affine_wake_with_weights(c, true);
+}
+
+#[cfg(all(tokio_unstable, target_os = "linux"))]
+fn cache_affine_wake_with_weights(c: &mut Criterion, weighted: bool) {
     let (workers, topology) = benchmark_topology();
     let partitions = topology.partition_count();
     let cache_bytes = std::env::var("TOKIO_LLC_BENCH_CACHE_BYTES")
@@ -211,9 +223,13 @@ fn cache_affine_wake(c: &mut Criterion) {
     let bytes_touched = tasks * cache_bytes * CACHE_ROUNDS;
     let worker_cpus = benchmark_worker_cpus(workers, partitions)
         .expect("the cache benchmark requires Linux sysfs topology");
-    let mut group = c.benchmark_group(format!(
-        "llc_aware/cache_affine_wake/{cache_bytes}_bytes"
-    ));
+    let workload = if weighted {
+        "cache_affine_wake_weighted"
+    } else {
+        "cache_affine_wake"
+    };
+    let mut group =
+        c.benchmark_group(format!("llc_aware/{workload}/{cache_bytes}_bytes"));
     group.throughput(Throughput::Bytes(bytes_touched as u64));
 
     for mode in [Mode::Disabled, Mode::Enabled] {
@@ -230,9 +246,13 @@ fn cache_affine_wake(c: &mut Criterion) {
                         let ready_tx = ready_tx.clone();
                         let partition = task % partitions;
                         let seed = iteration.wrapping_mul(tasks as u64).wrapping_add(task as u64);
+                        let mut builder = tokio::task::Builder::new().llc_partition(partition);
+                        if weighted {
+                            let lane = task / partitions;
+                            builder = builder.weight(if lane == 0 { 512 } else { 2048 });
+                        }
                         handles.push(
-                            tokio::task::Builder::new()
-                                .llc_partition(partition)
+                            builder
                                 .spawn_on(
                                     async move {
                                         // Allocation and first touch happen on the target worker
@@ -546,7 +566,8 @@ criterion_group!(
     remote_spawn,
     hinted_spawn,
     affine_wake,
-    cache_affine_wake
+    cache_affine_wake,
+    weighted_cache_affine_wake
 );
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 criterion_main!(llc_aware_benches);
