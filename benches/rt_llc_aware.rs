@@ -11,6 +11,8 @@
 //! the cache-affine wake benchmarks. The default is 2 MiB per task, with two
 //! tasks per LLC. Workers are pinned across the discovered LLCs for these
 //! benchmarks so each task first-touches its allocation on its target LLC.
+//! `TOKIO_LLC_BENCH_CACHE_TASKS_PER_LLC` can increase the task density to fill
+//! or exceed each LLC; for example, 16 tasks use 32 MiB per LLC by default.
 
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 use criterion::{
@@ -24,7 +26,7 @@ use std::future::poll_fn;
 use std::io;
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 use std::sync::{
-    atomic::{AtomicUsize, Ordering::Relaxed},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc, Arc,
 };
 #[cfg(all(tokio_unstable, target_os = "linux"))]
@@ -45,6 +47,12 @@ const CACHE_TASKS_PER_PARTITION: usize = 2;
 
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 const CACHE_ROUNDS: usize = 4;
+
+#[cfg(all(tokio_unstable, target_os = "linux"))]
+const WEIGHTED_CACHE_TASKS_PER_PARTITION: usize = 6;
+
+#[cfg(all(tokio_unstable, target_os = "linux"))]
+const WEIGHTED_CACHE_WEIGHTS: &[u32] = &[512, 1024, 2048];
 
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 #[derive(Clone, Copy)]
@@ -200,18 +208,26 @@ fn affine_wake(c: &mut Criterion) {
 /// caches but small enough for multiple tasks to remain resident in an LLC.
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 fn cache_affine_wake(c: &mut Criterion) {
-    cache_affine_wake_with_weights(c, false);
+    cache_affine_wake_with_weights(c, CACHE_TASKS_PER_PARTITION, None);
 }
 
-/// Runs the cache-affine workload with two competing weights in every LLC,
+/// Runs the cache-affine workload with six tasks and three weights in every LLC,
 /// exercising the weighted queue without changing the memory access pattern.
 #[cfg(all(tokio_unstable, target_os = "linux"))]
 fn weighted_cache_affine_wake(c: &mut Criterion) {
-    cache_affine_wake_with_weights(c, true);
+    cache_affine_wake_with_weights(
+        c,
+        WEIGHTED_CACHE_TASKS_PER_PARTITION,
+        Some(WEIGHTED_CACHE_WEIGHTS),
+    );
 }
 
 #[cfg(all(tokio_unstable, target_os = "linux"))]
-fn cache_affine_wake_with_weights(c: &mut Criterion, weighted: bool) {
+fn cache_affine_wake_with_weights(
+    c: &mut Criterion,
+    default_tasks_per_partition: usize,
+    weights: Option<&[u32]>,
+) {
     let (workers, topology) = benchmark_topology();
     let partitions = topology.partition_count();
     let cache_bytes = std::env::var("TOKIO_LLC_BENCH_CACHE_BYTES")
@@ -219,88 +235,99 @@ fn cache_affine_wake_with_weights(c: &mut Criterion, weighted: bool) {
         .and_then(|value| value.parse().ok())
         .filter(|bytes| *bytes >= 2 * std::mem::size_of::<usize>())
         .unwrap_or(CACHE_BYTES_PER_TASK);
-    let tasks = partitions * CACHE_TASKS_PER_PARTITION;
+    let tasks_per_partition = std::env::var("TOKIO_LLC_BENCH_CACHE_TASKS_PER_LLC")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|tasks| *tasks > 0)
+        .unwrap_or(default_tasks_per_partition);
+    let tasks = partitions * tasks_per_partition;
     let bytes_touched = tasks * cache_bytes * CACHE_ROUNDS;
     let worker_cpus = benchmark_worker_cpus(workers, partitions)
         .expect("the cache benchmark requires Linux sysfs topology");
-    let workload = if weighted {
+    let workload = if weights.is_some() {
         "cache_affine_wake_weighted"
     } else {
         "cache_affine_wake"
     };
-    let mut group =
-        c.benchmark_group(format!("llc_aware/{workload}/{cache_bytes}_bytes"));
+    let mut group = c.benchmark_group(format!(
+        "llc_aware/{workload}/{cache_bytes}_bytes/{tasks_per_partition}_tasks_per_llc"
+    ));
     group.throughput(Throughput::Bytes(bytes_touched as u64));
 
     for mode in [Mode::Disabled, Mode::Enabled] {
         let runtime = pinned_runtime(mode, workers, topology.clone(), worker_cpus.clone());
         group.bench_with_input(BenchmarkId::from_parameter(mode.name()), &mode, |b, _| {
+            let (ready_tx, ready_rx) = mpsc::channel::<Waker>();
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut handles = Vec::with_capacity(tasks);
+
+            for task in 0..tasks {
+                let ready_tx = ready_tx.clone();
+                let stop = stop.clone();
+                let partition = task % partitions;
+                let mut builder = tokio::task::Builder::new().llc_partition(partition);
+                if let Some(weights) = weights {
+                    let lane = task / partitions;
+                    builder = builder.weight(weights[lane % weights.len()]);
+                }
+                handles.push(
+                    builder
+                        .spawn_on(
+                            async move {
+                                // Allocation and first touch happen on the target worker
+                                // before timing begins.
+                                let links = pointer_cycle(cache_bytes, task as u64);
+                                let mut cursor = chase_pointers(&links, task % links.len());
+
+                                loop {
+                                    wait_for_external_wake(&ready_tx).await;
+                                    if stop.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    cursor = chase_pointers(&links, cursor);
+                                }
+
+                                (links, black_box(cursor))
+                            },
+                            runtime.handle(),
+                        )
+                        .unwrap(),
+                );
+            }
+            drop(ready_tx);
+
+            // Every task has initialized and reached its pending point before
+            // Criterion starts measuring the steady-state wake workload.
+            let mut wakers = receive_wakers(&ready_rx, tasks);
             b.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
 
-                for iteration in 0..iterations {
-                    let (ready_tx, ready_rx) = mpsc::channel::<Waker>();
-                    let mut handles = Vec::with_capacity(tasks);
-
-                    for task in 0..tasks {
-                        let ready_tx = ready_tx.clone();
-                        let partition = task % partitions;
-                        let seed = iteration.wrapping_mul(tasks as u64).wrapping_add(task as u64);
-                        let mut builder = tokio::task::Builder::new().llc_partition(partition);
-                        if weighted {
-                            let lane = task / partitions;
-                            builder = builder.weight(if lane == 0 { 512 } else { 2048 });
-                        }
-                        handles.push(
-                            builder
-                                .spawn_on(
-                                    async move {
-                                        // Allocation and first touch happen on the target worker
-                                        // before timing begins.
-                                        let links = pointer_cycle(cache_bytes, seed);
-                                        let mut cursor = chase_pointers(&links, task % links.len());
-
-                                        for _ in 0..CACHE_ROUNDS {
-                                            wait_for_external_wake(&ready_tx).await;
-                                            cursor = chase_pointers(&links, cursor);
-                                        }
-
-                                        (links, black_box(cursor))
-                                    },
-                                    runtime.handle(),
-                                )
-                                .unwrap(),
-                        );
-                    }
-                    drop(ready_tx);
-
-                    // Receiving one waker per task proves that every task has
-                    // initialized and returned Pending before timing begins.
-                    let mut wakers = receive_wakers(&ready_rx, tasks);
+                for _ in 0..iterations {
                     let start = Instant::now();
-                    for round in 0..CACHE_ROUNDS {
+                    for _ in 0..CACHE_ROUNDS {
                         for waker in wakers.drain(..) {
                             waker.wake();
                         }
-                        if round + 1 < CACHE_ROUNDS {
-                            wakers = receive_wakers(&ready_rx, tasks);
-                        }
+                        wakers = receive_wakers(&ready_rx, tasks);
                     }
-                    let completed = runtime.block_on(async {
-                        let mut completed = Vec::with_capacity(tasks);
-                        for handle in handles {
-                            completed.push(handle.await.unwrap());
-                        }
-                        completed
-                    });
                     elapsed += start.elapsed();
-                    // Keep destruction of the working sets outside the timed
-                    // region; allocator behavior is not under test.
-                    drop(black_box(completed));
                 }
 
                 elapsed
             });
+
+            stop.store(true, Ordering::Release);
+            for waker in wakers {
+                waker.wake();
+            }
+            let completed = runtime.block_on(async {
+                let mut completed = Vec::with_capacity(tasks);
+                for handle in handles {
+                    completed.push(handle.await.unwrap());
+                }
+                completed
+            });
+            drop(black_box(completed));
         });
     }
 
@@ -399,7 +426,7 @@ fn pinned_runtime(
     let mut builder = Builder::new_multi_thread();
     builder.worker_threads(workers).enable_all();
     builder.on_thread_start(move || {
-        let worker = next_worker.fetch_add(1, Relaxed);
+        let worker = next_worker.fetch_add(1, Ordering::Relaxed);
         if let Some(&cpu) = worker_cpus.get(worker) {
             pin_current_thread(cpu);
         }
